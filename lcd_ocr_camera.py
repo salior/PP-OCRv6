@@ -114,22 +114,104 @@ def preprocess_variants(image: np.ndarray, scale: float) -> List[Tuple[str, np.n
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     inv = cv2.bitwise_not(thresh)
 
+    # 自适应阈值：对 LCD 背光不均匀的情况更鲁棒，能更好保留小数点
+    adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 15, 5)
+    adaptive_inv = cv2.bitwise_not(adaptive)
+
+    # 形态学闭运算：连接断裂的笔画，同时保留小圆点
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
     return [
         ("raw", scaled),
         ("clahe", cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR)),
         ("thresh", cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)),
         ("inv", cv2.cvtColor(inv, cv2.COLOR_GRAY2BGR)),
+        ("adaptive", cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR)),
+        ("adaptive_inv", cv2.cvtColor(adaptive_inv, cv2.COLOR_GRAY2BGR)),
+        ("closed", cv2.cvtColor(closed, cv2.COLOR_GRAY2BGR)),
     ]
 
 
 def normalize_number(text: str) -> Optional[str]:
     cleaned = text.replace("O", "0").replace("o", "0").replace(" ", "")
     cleaned = cleaned.replace("，", ",").replace("。", ".")
-    matches = re.findall(r"[-+]?\d+(?:[\.,]\d+)?", cleaned)
+    # OCR 经常把小数点识别成这些字符
+    cleaned = cleaned.replace("·", ".").replace("•", ".").replace("°", ".")
+    cleaned = cleaned.replace("．", ".")  # 全角句点
+    # 去除首尾非数字非小数点的干扰字符
+    cleaned = re.sub(r"^[^\d+-]+|[^\d.]+$", "", cleaned)
+    matches = re.findall(r"[-+]?\d+(?:[.,]\d+)?", cleaned)
     if not matches:
         return None
     candidate = max(matches, key=len)
     return candidate.replace(",", ".")
+
+
+def detect_decimal_points(roi_gray: np.ndarray, scale: float) -> List[float]:
+    """在灰度图中检测可能是小数点的小圆点，返回它们的相对 x 坐标 (0~1)。"""
+    # 二值化
+    _, binary = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # 去除大块区域（数字笔画），只保留小连通域（小数点）
+    # 先做开运算去掉细线
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    img_h, img_w = roi_gray.shape[:2]
+    # 小数点的面积范围（相对于图像尺寸自适应）
+    min_area = max(4, int(img_w * img_h * 0.0002))
+    max_area = max(50, int(img_w * img_h * 0.008))
+    # 小数点的长宽比应该接近 1:1
+    min_aspect = 0.3
+
+    dot_positions: List[float] = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+        if aspect < min_aspect:
+            continue
+        # 小数点一般在数字的底部区域（下半 60%）
+        if y > img_h * 0.3:
+            dot_positions.append((x + w / 2) / img_w)
+
+    return sorted(dot_positions)
+
+
+def apply_decimal_heuristic(
+    candidates: List[NumberCandidate],
+    dot_positions: List[float],
+) -> List[NumberCandidate]:
+    """如果 OCR 结果没有小数点，但检测到了疑似小数点，尝试插入小数点。"""
+    if not dot_positions:
+        return candidates
+
+    enhanced: List[NumberCandidate] = list(candidates)
+    for value, score in candidates:
+        if "." in value:
+            continue  # 已经有小数点了
+        digits = re.sub(r"[^\d]", "", value)
+        if len(digits) < 2:
+            continue
+        sign = ""
+        if value and value[0] in "+-":
+            sign = value[0]
+        # 对每个检测到的点位置，尝试在对应位置插入小数点
+        for dot_x in dot_positions:
+            insert_pos = round(dot_x * len(digits))
+            insert_pos = max(1, min(insert_pos, len(digits) - 1))
+            new_value = sign + digits[:insert_pos] + "." + digits[insert_pos:]
+            # 置信度稍微降低一点，因为是重建的
+            enhanced.append((new_value, score * 0.9))
+
+    return enhanced
 
 
 def extract_from_legacy(result: Sequence[Sequence[object]]) -> List[NumberCandidate]:
@@ -272,9 +354,18 @@ def main() -> int:
             if now - last_ocr_at >= args.interval:
                 candidates: List[NumberCandidate] = []
                 best_source = "none"
+
+                # 检测小数点位置（在放大后的灰度图上做轮廓分析）
+                scaled_for_dot = cv2.resize(target, None, fx=args.scale, fy=args.scale,
+                                            interpolation=cv2.INTER_CUBIC)
+                gray_for_dot = cv2.cvtColor(scaled_for_dot, cv2.COLOR_BGR2GRAY)
+                dot_positions = detect_decimal_points(gray_for_dot, args.scale)
+
                 for source_name, variant in preprocess_variants(target, args.scale):
                     variant_candidates = run_ocr(ocr, variant)
                     if variant_candidates:
+                        # 对没有小数点的候选结果，尝试用检测到的点重建
+                        variant_candidates = apply_decimal_heuristic(variant_candidates, dot_positions)
                         candidates.extend(variant_candidates)
                         best_source = source_name
                 best = pick_best_candidate(candidates, args.min_score)
