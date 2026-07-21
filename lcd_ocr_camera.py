@@ -300,9 +300,54 @@ def draw_overlay(
     return display
 
 
+def open_capture(args: argparse.Namespace) -> Optional[cv2.VideoCapture]:
+    """按本地摄像头或 RTSP 地址创建视频采集对象。"""
+    if args.rtsp_url:
+        # OpenCV 的 FFmpeg 后端在创建 VideoCapture 前读取此环境变量。
+        # TCP 通常比 UDP 更适合跨交换机、Wi-Fi 等容易丢包的网络环境。
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{args.rtsp_transport}"
+        cap = cv2.VideoCapture(args.rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            # 个别 OpenCV 发行版没有编译 FFmpeg 时，让 OpenCV 选择可用后端再试一次。
+            cap.release()
+            cap = cv2.VideoCapture(args.rtsp_url)
+        return cap
+
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(args.camera)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    return cap
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="使用摄像头识别液晶数字的 PP-OCRv6 示例")
     parser.add_argument("--camera", type=int, default=0, help="摄像头编号，默认 0")
+    parser.add_argument(
+        "--rtsp-url",
+        help="RTSP 摄像头地址；提供后优先使用该地址，例如 rtsp://user:password@192.168.1.64:554/Streaming/Channels/101",
+    )
+    parser.add_argument(
+        "--rtsp-transport",
+        choices=["tcp", "udp"],
+        default="tcp",
+        help="RTSP 传输协议，默认 tcp；局域网低延迟场景可尝试 udp",
+    )
+    parser.add_argument(
+        "--rtsp-reconnect-attempts",
+        type=int,
+        default=3,
+        help="RTSP 断流后的重连次数；设为 0 可关闭自动重连",
+    )
+    parser.add_argument(
+        "--rtsp-reconnect-delay",
+        type=float,
+        default=2.0,
+        help="RTSP 每次重连前等待秒数，默认 2 秒",
+    )
     parser.add_argument("--width", type=int, default=1280, help="摄像头宽度")
     parser.add_argument("--height", type=int, default=720, help="摄像头高度")
     parser.add_argument("--roi-ratio", type=float, default=0.55, help="中心识别框占画面宽度比例")
@@ -317,17 +362,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.rtsp_reconnect_attempts < 0 or args.rtsp_reconnect_delay < 0:
+        print("RTSP 重连次数和等待时间不能为负数。", file=sys.stderr)
+        return 2
+
     ocr = build_ocr(OCRConfig(lang=args.lang, device=args.device, engine=args.engine, min_score=args.min_score))
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+    cap = open_capture(args)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print("无法打开摄像头，请确认摄像头编号是否正确。", file=sys.stderr)
+        if args.rtsp_url:
+            print("无法打开 RTSP 视频流，请确认地址、账号密码、网络和摄像头 RTSP 服务。", file=sys.stderr)
+        else:
+            print("无法打开摄像头，请确认摄像头编号是否正确。", file=sys.stderr)
         return 1
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
     current_value = "--"
     current_score = 0.0
@@ -335,13 +382,29 @@ def main() -> int:
     use_roi_only = True
     last_ocr_at = 0.0
     last_frame_at = time.perf_counter()
+    reconnect_attempt = 0
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
-                print("读取摄像头画面失败。", file=sys.stderr)
+                if args.rtsp_url and reconnect_attempt < args.rtsp_reconnect_attempts:
+                    reconnect_attempt += 1
+                    print(
+                        f"RTSP 视频流读取失败，{args.rtsp_reconnect_delay:g} 秒后重连 "
+                        f"({reconnect_attempt}/{args.rtsp_reconnect_attempts})...",
+                        file=sys.stderr,
+                    )
+                    cap.release()
+                    time.sleep(args.rtsp_reconnect_delay)
+                    cap = open_capture(args)
+                    if cap.isOpened():
+                        last_frame_at = time.perf_counter()
+                    continue
+                print("读取 RTSP 视频流失败。" if args.rtsp_url else "读取摄像头画面失败。", file=sys.stderr)
                 break
+
+            reconnect_attempt = 0
 
             roi_image, roi_box = center_roi(frame, args.roi_ratio)
             target = roi_image if use_roi_only else frame

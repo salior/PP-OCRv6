@@ -29,13 +29,29 @@ python lcd_ocr_camera.py --device gpu
 python lcd_ocr_camera.py --roi-ratio 0.4 --scale 2.5
 python lcd_ocr_camera.py --engine onnxruntime
 ```
-d:\python\PP-OCRv6\.venv\Scripts\python.exe d:/python/PP-OCRv6/lcd_ocr_camera.py --engine onnxruntime --roi-ratio 0.4
+
+### RTSP 网络摄像头接入
+
+将 `--rtsp-url` 换成摄像头实际的 RTSP 地址即可测试网络视频流；指定该参数后会优先于 `--camera` 生效。默认使用 TCP，网络波动时更稳定。
+
+```powershell
+python lcd_ocr_camera.py --rtsp-url "rtsp://用户名:密码@192.168.1.64:554/Streaming/Channels/101"
+python lcd_ocr_camera.py --rtsp-url "rtsp://admin:123456@192.168.1.64:554/stream1" --rtsp-transport udp
+```
+
+- `--rtsp-transport tcp|udp`：RTSP 传输协议，默认 `tcp`；在稳定的局域网中可试 `udp` 以降低延迟。
+- `--rtsp-reconnect-attempts 3`：断流后最多重连次数，设为 `0` 可关闭重连。
+- `--rtsp-reconnect-delay 2`：每次重连前的等待秒数。
+- RTSP 流使用摄像头自身输出的分辨率，因此 `--width`、`--height` 只作用于本地 USB 摄像头。
+
+若无法打开视频流，请先用 VLC 等播放器验证 RTSP 地址；确认电脑能访问摄像头的 IP/端口，并在摄像头后台开启 RTSP 服务。用户名或密码含有 `@`、`:`、`/` 等字符时，需要进行 URL 编码（例如 `@` 写成 `%40`）。
 
 ## 3. 使用说明
 
 - 默认只识别画面中央框，适合把液晶表盘对准框内，速度更快。
 - 按 `c` 可以切换为全画面识别。
 - 按 `q` 退出。
+- RTSP 流中断时，程序会按配置自动重连，并在控制台输出重连进度。
 
 ## 4. 提升识别率的建议
 
